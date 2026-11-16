@@ -387,3 +387,67 @@ func Test_KeepAlive_RenewsRegistration(t *testing.T) {
 
 	cancel()
 }
+
+func Test_ParseCitadel(t *testing.T) {
+	t.Parallel()
+
+	citadels, err := parseCitadel("http://10.10.0.1:18082=citadel-0, 10.10.0.2:18082=citadel-1, localhost:18082")
+	require.NoError(t, err)
+	require.Equal(t, []instance{
+		{Addr: "10.10.0.1:18082", Container: "citadel-0"},
+		{Addr: "10.10.0.2:18082", Container: "citadel-1"},
+		{Addr: "localhost:18082"},
+	}, citadels)
+
+	_, err = parseCitadel("bad-addr")
+	require.Error(t, err)
+
+	_, err = parseCitadel(" , ")
+	require.Error(t, err)
+}
+
+func Test_Do_FailoverToNextCitadel(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("key:\n  type: int\n  value: 1\n"), 0o600))
+
+	// первый инстанс недоступен: запрос уходит во второй и succeeds.
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(syncResponse{Configs: []Entry{{Name: "key", Type: TypeString, Value: "2"}}})
+	}))
+	t.Cleanup(live.Close)
+
+	c, err := New(testApp, deadURL+","+live.URL, path)
+	require.NoError(t, err)
+	require.NoError(t, c.Sync(context.Background()))
+	require.Equal(t, "2", c.String("key"))
+}
+
+func Test_CitadelAddr_PrefersSameHost(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(path, []byte("key:\n  type: int\n  value: 1\n"), 0o600))
+
+	// сервис на 10.10.0.1: все запросы к citadel идут в локальный инстанс
+	// по имени контейнера, а не по round-robin на чужой сервер. selfHost
+	// заполняется в Register; здесь он задан напрямую, без сети.
+	c, err := New(testApp, "10.10.0.1:18082=citadel-0,10.10.0.2:18082=citadel-1", path)
+	require.NoError(t, err)
+	c.selfHost.Store("10.10.0.1")
+
+	for range 3 {
+		require.Equal(t, "http://citadel-0:80", c.CitadelAddr())
+	}
+
+	// до регистрации локальный хост неизвестен: round-robin по публичным адресам.
+	c2, err := New(testApp, "10.10.0.1:18082=citadel-0,10.10.0.2:18082=citadel-1", path)
+	require.NoError(t, err)
+	require.Equal(t, "http://10.10.0.1:18082", c2.CitadelAddr())
+	require.Equal(t, "http://10.10.0.2:18082", c2.CitadelAddr())
+}

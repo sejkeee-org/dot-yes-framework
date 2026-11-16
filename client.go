@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -53,9 +54,12 @@ type (
 // Client конфиг приложения: до синхронизации — значения из yaml,
 // после — значения из citadel, обновляемые в реальном времени.
 type Client struct {
-	app  string
-	base string
-	http *http.Client
+	app      string
+	citadels []instance
+	http     *http.Client
+
+	// citadelIdx счётчик round-robin по инстансам citadel.
+	citadelIdx atomic.Uint64
 
 	mu       sync.RWMutex
 	values   map[string]Entry
@@ -71,18 +75,52 @@ type Client struct {
 	selfHost atomic.Value
 }
 
-// New читает yaml-конфиг приложения и возвращает клиент citadel.
-func New(app, adminURL, yamlPath string) (*Client, error) {
+// New читает yaml-конфиг приложения и возвращает клиент citadel. citadel —
+// список адресов инстансов через запятую в формате «адрес=имя_контейнера»
+// (адрес = хост:порт, имя контейнера можно опустить): запросы ходят
+// по инстансам round-robin, сбойный инстанс обходится.
+func New(app, citadel, yamlPath string) (*Client, error) {
 	local, err := Load(yamlPath)
 	if err != nil {
 		return nil, err
 	}
+	citadels, err := parseCitadel(citadel)
+	if err != nil {
+		return nil, err
+	}
 	return &Client{
-		app:    app,
-		base:   strings.TrimRight(adminURL, "/"),
-		http:   &http.Client{Timeout: httpTimeout},
-		values: local,
+		app:      app,
+		citadels: citadels,
+		http:     &http.Client{Timeout: httpTimeout},
+		values:   local,
 	}, nil
+}
+
+// parseCitadel разбирает список адресов citadel: элементы через запятую,
+// каждый — «адрес[=имя_контейнера]»; схема http:// допустима и отбрасывается.
+func parseCitadel(list string) ([]instance, error) {
+	entries := strings.Split(list, ",")
+	citadels := make([]instance, 0, len(entries))
+	for _, e := range entries {
+		e = strings.TrimSpace(e)
+		e = strings.TrimPrefix(e, "http://")
+		e = strings.TrimPrefix(e, "https://")
+		if e == "" {
+			continue
+		}
+		inst := instance{Addr: e}
+		if addr, container, ok := strings.Cut(e, "="); ok {
+			inst = instance{Addr: addr, Container: container}
+		}
+		if _, _, err := net.SplitHostPort(inst.Addr); err != nil {
+			return nil, fmt.Errorf("failed parse citadel addr %q: %w", inst.Addr, err)
+		}
+		citadels = append(citadels, inst)
+	}
+	if len(citadels) == 0 {
+		return nil, errors.New("citadel address list is empty")
+	}
+	return citadels, nil
 }
 
 // Sync отправляет в citadel ключи из yaml: отсутствующие дозаписываются,
@@ -217,8 +255,10 @@ func (c *Client) Time(name string) time.Time {
 	return v
 }
 
-// do выполняет запрос к citadel и возвращает тело ответа; каждая ошибка
-// вызова логируется. pathArgs — подстановки в path (по умолчанию имя приложения).
+// do выполняет запрос к citadel и возвращает тело ответа. Инстансы citadel
+// обходятся в порядке citadelOrder (локальный — первым); сбойный инстанс
+// (кроме штатного ErrNotFound) заменяется следующим. Каждая ошибка вызова
+// логируется. pathArgs — подстановки в path (по умолчанию имя приложения).
 func (c *Client) do(ctx context.Context, method, path string, body []byte, wantStatus int, pathArgs ...string) ([]byte, error) {
 	args := make([]any, 0, len(pathArgs)+1)
 	for _, arg := range pathArgs {
@@ -227,16 +267,27 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, wantS
 	if len(args) == 0 {
 		args = append(args, c.app)
 	}
-	url := c.base + fmt.Sprintf(path, args...)
+	reqPath := fmt.Sprintf(path, args...)
 
-	data, err := c.send(ctx, method, url, body, wantStatus)
-	if err != nil {
+	start := int(c.citadelIdx.Add(1) - 1)
+	self := c.selfHostAddr()
+	var data []byte
+	var err error
+	for _, inst := range c.citadelOrder(start) {
+		url := "http://" + localAddr(inst, self) + reqPath
+		data, err = c.send(ctx, method, url, body, wantStatus)
+		if err == nil {
+			return data, nil
+		}
+		if errors.Is(err, ErrNotFound) {
+			return nil, err
+		}
 		slog.Error("citadel request failed",
 			slog.String("method", method),
 			slog.String("url", url),
 			slog.Any("error", err))
 	}
-	return data, err
+	return nil, err
 }
 
 // send выполняет HTTP-запрос и возвращает тело ответа.

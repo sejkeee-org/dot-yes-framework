@@ -30,6 +30,13 @@ func containerName() string {
 	return os.Getenv(containerNameEnv)
 }
 
+// selfHostAddr возвращает хост собственного advertise-адреса; пустую строку,
+// если сервис ещё не регистрировался.
+func (c *Client) selfHostAddr() string {
+	host, _ := c.selfHost.Load().(string)
+	return host
+}
+
 type (
 	discoveryRequest struct {
 		Addr      string `json:"addr"`
@@ -90,7 +97,7 @@ func (c *Client) DiscoverAll(ctx context.Context, name string) ([]string, error)
 	}
 
 	addrs := make([]string, 0, len(resp.Instances))
-	self, _ := c.selfHost.Load().(string)
+	self := c.selfHostAddr()
 	for _, inst := range resp.Instances {
 		addrs = append(addrs, localAddr(inst, self))
 	}
@@ -104,6 +111,23 @@ func (c *Client) DiscoverAll(ctx context.Context, name string) ([]string, error)
 // в несуществующий инстанс.
 func (c *Client) Invalidate(name string) {
 	c.discovered.Delete(name)
+}
+
+// CitadelAddr возвращает адрес инстанса citadel. Если инстанс живёт на том же
+// хосте, что и сам сервис, — адрес по имени его контейнера (docker-сеть);
+// иначе очередной инстанс по round-robin. Для потребителей, ходящих в citadel
+// напрямую (reverse proxy контрольной панели).
+func (c *Client) CitadelAddr() string {
+	self := c.selfHostAddr()
+	if self != "" {
+		for _, inst := range c.citadels {
+			if host, _, err := net.SplitHostPort(inst.Addr); err == nil && host == self {
+				return "http://" + localAddr(inst, self)
+			}
+		}
+	}
+	start := int(c.citadelIdx.Add(1) - 1)
+	return "http://" + localAddr(c.citadels[start%len(c.citadels)], self)
 }
 
 // Discover возвращает адрес одного живого инстанса, выбирая их по round-robin;
@@ -153,4 +177,33 @@ func localAddr(inst instance, selfHost string) string {
 		return inst.Addr
 	}
 	return net.JoinHostPort(inst.Container, containerPort)
+}
+
+// sameHost проверяет, что инстанс зарегистрирован на хосте selfHost.
+func sameHost(inst instance, selfHost string) bool {
+	if selfHost == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(inst.Addr)
+	return err == nil && host == selfHost
+}
+
+// citadelOrder выстраивает порядок обхода инстансов citadel: локальные
+// (тот же хост) первыми — по docker-сети, остальные начиная с очередного
+// по round-robin — как фейловер.
+func (c *Client) citadelOrder(start int) []instance {
+	self := c.selfHostAddr()
+	order := make([]instance, 0, len(c.citadels))
+	for _, inst := range c.citadels {
+		if sameHost(inst, self) {
+			order = append(order, inst)
+		}
+	}
+	for i := range c.citadels {
+		inst := c.citadels[(start+i)%len(c.citadels)]
+		if !sameHost(inst, self) {
+			order = append(order, inst)
+		}
+	}
+	return order
 }
