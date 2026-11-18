@@ -81,7 +81,7 @@ func newFakeAdmin(t *testing.T) (*fakeAdmin, *httptest.Server) {
 				return
 			}
 		}
-		f.services[name] = append(f.services[name], instance{Addr: addr, Container: req.Container})
+		f.services[name] = append(f.services[name], instance{Addr: addr})
 		w.WriteHeader(http.StatusNoContent)
 	})
 
@@ -266,7 +266,7 @@ func Test_Register_Discover(t *testing.T) {
 
 	addr, err := c.Discover(context.Background(), "dungeon-master")
 	require.NoError(t, err)
-	require.Equal(t, "app:8080", addr)
+	require.Equal(t, "http://app:8080", addr)
 
 	// незарегистрированный сервис — ErrNotFound.
 	_, err = c.Discover(context.Background(), "unknown")
@@ -285,7 +285,7 @@ func Test_DiscoverAll_MultipleInstances(t *testing.T) {
 
 	addrs, err := c.DiscoverAll(context.Background(), "dungeon-master")
 	require.NoError(t, err)
-	require.Equal(t, []string{"app-1:8080", "app-2:8080"}, addrs)
+	require.Equal(t, []string{"http://app-1:8080", "http://app-2:8080"}, addrs)
 }
 
 func Test_DiscoverAll_CachesUntilInvalidate(t *testing.T) {
@@ -299,19 +299,19 @@ func Test_DiscoverAll_CachesUntilInvalidate(t *testing.T) {
 	ctx := context.Background()
 	addrs, err := c.DiscoverAll(ctx, "dungeon-master")
 	require.NoError(t, err)
-	require.Equal(t, []string{"app-1:8080"}, addrs)
+	require.Equal(t, []string{"http://app-1:8080"}, addrs)
 
 	// новый инстанс зарегистрирован, но кэш продолжает отдавать старый список.
 	require.NoError(t, c.Register(ctx, "dungeon-master", "app-2:8080"))
 	addrs, err = c.DiscoverAll(ctx, "dungeon-master")
 	require.NoError(t, err)
-	require.Equal(t, []string{"app-1:8080"}, addrs)
+	require.Equal(t, []string{"http://app-1:8080"}, addrs)
 
 	// отчёт о несуществующем инстансе сбрасывает кэш: список запрашивается заново.
 	c.Invalidate("dungeon-master")
 	addrs, err = c.DiscoverAll(ctx, "dungeon-master")
 	require.NoError(t, err)
-	require.Equal(t, []string{"app-1:8080", "app-2:8080"}, addrs)
+	require.Equal(t, []string{"http://app-1:8080", "http://app-2:8080"}, addrs)
 }
 
 func Test_Discover_RoundRobin(t *testing.T) {
@@ -331,41 +331,7 @@ func Test_Discover_RoundRobin(t *testing.T) {
 		require.NoError(t, err)
 		got = append(got, addr)
 	}
-	require.Equal(t, []string{"app-1:8080", "app-2:8080", "app-1:8080", "app-2:8080"}, got)
-}
-
-func Test_DiscoverAll_SameHost_UsesContainerName(t *testing.T) {
-	t.Parallel()
-
-	f, srv := newFakeAdmin(t)
-	c := testClient(t, "key:\n  type: int\n  value: 1\n", srv.URL)
-
-	// клиент живёт на хосте 10.0.0.1: локальный инстанс резолвится по имени
-	// контейнера, соседний по хосту — по обычному адресу.
-	require.NoError(t, c.Register(context.Background(), "admin-panel", "10.0.0.1:18081"))
-	f.mu.Lock()
-	f.services["dungeon-master"] = []instance{
-		{Addr: "10.0.0.1:18080", Container: "dungeon-master-0"},
-		{Addr: "10.0.0.2:18080", Container: "dungeon-master-0"},
-	}
-	f.mu.Unlock()
-
-	addrs, err := c.DiscoverAll(context.Background(), "dungeon-master")
-	require.NoError(t, err)
-	require.Equal(t, []string{"dungeon-master-0:80", "10.0.0.2:18080"}, addrs)
-}
-
-func Test_Register_SendsContainerName(t *testing.T) {
-	t.Setenv(containerNameEnv, "admin-panel-0")
-
-	f, srv := newFakeAdmin(t)
-	c := testClient(t, "key:\n  type: int\n  value: 1\n", srv.URL)
-
-	require.NoError(t, c.Register(context.Background(), "admin-panel", "10.0.0.1:18081"))
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	require.Equal(t, []instance{{Addr: "10.0.0.1:18081", Container: "admin-panel-0"}}, f.services["admin-panel"])
+	require.Equal(t, []string{"http://app-1:8080", "http://app-2:8080", "http://app-1:8080", "http://app-2:8080"}, got)
 }
 
 func Test_KeepAlive_RenewsRegistration(t *testing.T) {
@@ -391,19 +357,34 @@ func Test_KeepAlive_RenewsRegistration(t *testing.T) {
 func Test_ParseCitadel(t *testing.T) {
 	t.Parallel()
 
-	citadels, err := parseCitadel("http://10.10.0.1:18082=citadel-0, 10.10.0.2:18082=citadel-1, localhost:18082")
+	citadels, err := parseCitadel("http://citadel:80, citadel-1.dot-yes:80, 10.10.0.2:18082")
 	require.NoError(t, err)
 	require.Equal(t, []instance{
-		{Addr: "10.10.0.1:18082", Container: "citadel-0"},
-		{Addr: "10.10.0.2:18082", Container: "citadel-1"},
-		{Addr: "localhost:18082"},
+		{Addr: "citadel:80"},
+		{Addr: "citadel-1.dot-yes:80"},
+		{Addr: "10.10.0.2:18082"},
 	}, citadels)
-
-	_, err = parseCitadel("bad-addr")
-	require.Error(t, err)
 
 	_, err = parseCitadel(" , ")
 	require.Error(t, err)
+}
+
+func Test_SendsInternalToken(t *testing.T) {
+	// t.Setenv несовместим с t.Parallel: env глобален.
+
+	// INTERNAL_TOKEN уходит заголовком в каждом запросе к citadel.
+	t.Setenv(internalTokenEnv, "secret-internal-token")
+
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get(internalTokenHeader)
+		writeEntries(w, map[string]Entry{})
+	}))
+	defer srv.Close()
+
+	c := testClient(t, "key:\n  type: int\n  value: 1\n", srv.URL)
+	require.NoError(t, c.Sync(context.Background()))
+	require.Equal(t, "secret-internal-token", got)
 }
 
 func Test_Do_FailoverToNextCitadel(t *testing.T) {
@@ -428,26 +409,32 @@ func Test_Do_FailoverToNextCitadel(t *testing.T) {
 	require.Equal(t, "2", c.String("key"))
 }
 
-func Test_CitadelAddr_PrefersSameHost(t *testing.T) {
-	t.Parallel()
+func Test_New_AuthRequired(t *testing.T) {
+	// t.Setenv несовместим с t.Parallel: env глобален.
 
 	path := filepath.Join(t.TempDir(), "config.yaml")
 	require.NoError(t, os.WriteFile(path, []byte("key:\n  type: int\n  value: 1\n"), 0o600))
 
-	// сервис на 10.10.0.1: все запросы к citadel идут в локальный инстанс
-	// по имени контейнера, а не по round-robin на чужой сервер. selfHost
-	// заполняется в Register; здесь он задан напрямую, без сети.
-	c, err := New(testApp, "10.10.0.1:18082=citadel-0,10.10.0.2:18082=citadel-1", path)
-	require.NoError(t, err)
-	c.selfHost.Store("10.10.0.1")
+	// защищённое окружение без INTERNAL_TOKEN: клиент не создаётся —
+	// молча ходить без токена в проде нельзя.
+	t.Setenv(authRequiredEnv, "true")
+	t.Setenv(internalTokenEnv, "")
+	_, err := New(testApp, "127.0.0.1:18082", path)
+	require.ErrorContains(t, err, internalTokenEnv)
 
-	for range 3 {
-		require.Equal(t, "http://citadel-0:80", c.CitadelAddr())
-	}
-
-	// до регистрации локальный хост неизвестен: round-robin по публичным адресам.
-	c2, err := New(testApp, "10.10.0.1:18082=citadel-0,10.10.0.2:18082=citadel-1", path)
+	// токен задан — клиент создаётся.
+	t.Setenv(internalTokenEnv, "secret")
+	c, err := New(testApp, "127.0.0.1:18082", path)
 	require.NoError(t, err)
-	require.Equal(t, "http://10.10.0.1:18082", c2.CitadelAddr())
-	require.Equal(t, "http://10.10.0.2:18082", c2.CitadelAddr())
+	require.Equal(t, "secret", c.token)
+}
+
+func Test_CitadelAddr_RoundRobin(t *testing.T) {
+	t.Parallel()
+
+	c := testClient(t, "key:\n  type: int\n  value: 1\n", "citadel:80,citadel-1.dot-yes:80")
+
+	require.Equal(t, "http://citadel:80", c.CitadelAddr())
+	require.Equal(t, "http://citadel-1.dot-yes:80", c.CitadelAddr())
+	require.Equal(t, "http://citadel:80", c.CitadelAddr())
 }

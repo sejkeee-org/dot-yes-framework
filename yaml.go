@@ -14,11 +14,15 @@ import (
 const floatBits = 64
 
 // Load читает yaml-конфиг и возвращает плоский набор ключей. Каждый ключ
-// объявляет свой тип и значение:
+// объявляет свой тип и значение; опционально — writable (можно ли менять
+// значение в админке, по умолчанию да) и restart_required (нужен ли рестарт
+// для применения, по умолчанию нет):
 //
 //	http_addr:
 //	  type: string
 //	  value: ":8080"
+//	  writable: false
+//	  restart_required: true
 //	max_players:
 //	  type: int
 //	  value: 4
@@ -65,11 +69,9 @@ func flatten(prefix string, in map[string]any, out map[string]Entry) error {
 	return nil
 }
 
-// isEntry проверяет, что секция — объявление ключа: ровно поля type и value.
+// isEntry проверяет, что секция — объявление ключа: обязательны type и value,
+// опциональны writable и restart_required.
 func isEntry(section map[string]any) bool {
-	if len(section) != 2 {
-		return false
-	}
 	_, hasType := section["type"]
 	_, hasValue := section["value"]
 	return hasType && hasValue
@@ -89,7 +91,28 @@ func toEntry(name string, val any) (Entry, error) {
 	if err := validateValue(typ, value); err != nil {
 		return Entry{}, fmt.Errorf("key %q: %w", name, err)
 	}
-	return Entry{Name: name, Type: typ, Value: value}, nil
+	// по умолчанию ключ доступен для изменения и применяется без рестарта.
+	e := Entry{Name: name, Type: typ, Value: value, Writable: true}
+	for key, v := range section {
+		switch key {
+		case "type", "value":
+		case "writable":
+			b, ok := v.(bool)
+			if !ok {
+				return Entry{}, fmt.Errorf("key %q: writable must be boolean", name)
+			}
+			e.Writable = b
+		case "restart_required":
+			b, ok := v.(bool)
+			if !ok {
+				return Entry{}, fmt.Errorf("key %q: restart_required must be boolean", name)
+			}
+			e.RestartRequired = b
+		default:
+			return Entry{}, fmt.Errorf("key %q: unknown field %q", name, key)
+		}
+	}
+	return e, nil
 }
 
 // ValidType проверяет, что тип поддерживается.

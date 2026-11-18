@@ -41,15 +41,59 @@ features:
 
 	entries, err := Load(path)
 	require.NoError(t, err)
+	// флаги по умолчанию: writable = true, restart_required = false.
 	require.Equal(t, map[string]Entry{
-		"http_addr":    {Name: "http_addr", Type: TypeString, Value: ":8080"},
-		"pool.size":    {Name: "pool.size", Type: TypeInt, Value: "4"},
-		"pool.timeout": {Name: "pool.timeout", Type: TypeDuration, Value: "5s"},
-		"enabled":      {Name: "enabled", Type: TypeBool, Value: "true"},
-		"ratio":        {Name: "ratio", Type: TypeFloat, Value: "0.5"},
-		"deadline":     {Name: "deadline", Type: TypeTime, Value: "2026-11-11T12:00:00Z"},
-		"features":     {Name: "features", Type: TypeString, Value: "[a, b]"},
+		"http_addr":    {Name: "http_addr", Type: TypeString, Value: ":8080", Writable: true},
+		"pool.size":    {Name: "pool.size", Type: TypeInt, Value: "4", Writable: true},
+		"pool.timeout": {Name: "pool.timeout", Type: TypeDuration, Value: "5s", Writable: true},
+		"enabled":      {Name: "enabled", Type: TypeBool, Value: "true", Writable: true},
+		"ratio":        {Name: "ratio", Type: TypeFloat, Value: "0.5", Writable: true},
+		"deadline":     {Name: "deadline", Type: TypeTime, Value: "2026-11-11T12:00:00Z", Writable: true},
+		"features":     {Name: "features", Type: TypeString, Value: "[a, b]", Writable: true},
 	}, entries)
+}
+
+func Test_Load_Flags(t *testing.T) {
+	t.Parallel()
+
+	// флаги читаются из объявления ключа.
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := `
+http_addr:
+  type: string
+  value: ":8080"
+  writable: false
+  restart_required: true
+max_players:
+  type: int
+  value: 4
+  writable: true
+  restart_required: false
+`
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+
+	entries, err := Load(path)
+	require.NoError(t, err)
+	require.False(t, entries["http_addr"].Writable)
+	require.True(t, entries["http_addr"].RestartRequired)
+	require.True(t, entries["max_players"].Writable)
+	require.False(t, entries["max_players"].RestartRequired)
+}
+
+func Test_Load_BadFlags(t *testing.T) {
+	t.Parallel()
+
+	for _, body := range []string{
+		"key:\n  type: int\n  value: 1\n  writable: yes-please\n",
+		"key:\n  type: int\n  value: 1\n  restart_required: maybe\n",
+		"key:\n  type: int\n  value: 1\n  extra: x\n",
+	} {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+
+		_, err := Load(path)
+		require.Error(t, err, body)
+	}
 }
 
 func Test_Load_UnknownType(t *testing.T) {

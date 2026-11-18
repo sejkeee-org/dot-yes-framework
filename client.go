@@ -2,6 +2,9 @@
 // (yaml дозаписывает новые ключи, изменения подхватываются без перезапуска),
 // service discovery с клиентской балансировкой между инстансами и HTTP-мидлвара
 // с метриками Prometheus (время ответа, коды, RPS по хендлерам).
+//
+// Сервисы ходят друг в другу по http внутри k8s-кластера; аутентификация —
+// INTERNAL_TOKEN, шифрование канала обеспечивает сетевой уровень кластера.
 package dotyes
 
 import (
@@ -14,6 +17,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,6 +32,17 @@ var ErrNotFound = errors.New("service not found")
 const (
 	httpTimeout          = 3 * time.Second
 	defaultWatchInterval = 5 * time.Second
+
+	// internalTokenEnv переменная с внутренним токеном API citadel;
+	// пустое значение — запросы без токена (локальный запуск без защиты).
+	internalTokenEnv = "INTERNAL_TOKEN"
+	// internalTokenHeader заголовок, которым сервис подтверждает доступ к API citadel.
+	internalTokenHeader = "X-Internal-Token"
+
+	// authRequiredEnv включает fail-closed режим: в защищённом окружении
+	// (прод) отсутствие INTERNAL_TOKEN — ошибка старта, а не тихая работа
+	// без защиты. Локально не задана — проверки выключены.
+	authRequiredEnv = "AUTH_REQUIRED"
 )
 
 const (
@@ -40,6 +55,10 @@ type Entry struct {
 	Name  string `json:"name"`
 	Type  string `json:"type"`
 	Value string `json:"value"`
+	// Writable можно ли менять значение в админке.
+	Writable bool `json:"writable"`
+	// RestartRequired применяется ли значение только после рестарта приложения.
+	RestartRequired bool `json:"restart_required"`
 }
 
 type (
@@ -57,6 +76,8 @@ type Client struct {
 	app      string
 	citadels []instance
 	http     *http.Client
+	// token внутренний токен API citadel: уходит заголовком в каждом запросе.
+	token string
 
 	// citadelIdx счётчик round-robin по инстансам citadel.
 	citadelIdx atomic.Uint64
@@ -70,16 +91,17 @@ type Client struct {
 	// discovered: кэш адресов discovery; живёт, пока запросы по кэшированным
 	// адресам доходят до существующих инстансов, сбрасывается Invalidate.
 	discovered sync.Map
-	// selfHost хост собственного advertise-адреса: инстансы того же хоста
-	// резолвятся по имени контейнера (docker-сеть). Заполняется в Register.
-	selfHost atomic.Value
 }
 
 // New читает yaml-конфиг приложения и возвращает клиент citadel. citadel —
-// список адресов инстансов через запятую в формате «адрес=имя_контейнера»
-// (адрес = хост:порт, имя контейнера можно опустить): запросы ходят
-// по инстансам round-robin, сбойный инстанс обходится.
+// список адресов инстансов через запятую: запросы ходят по инстансам
+// round-robin, сбойный инстанс обходится.
 func New(app, citadel, yamlPath string) (*Client, error) {
+	if authRequired() {
+		if err := requireSecureEnv(); err != nil {
+			return nil, err
+		}
+	}
 	local, err := Load(yamlPath)
 	if err != nil {
 		return nil, err
@@ -91,13 +113,48 @@ func New(app, citadel, yamlPath string) (*Client, error) {
 	return &Client{
 		app:      app,
 		citadels: citadels,
-		http:     &http.Client{Timeout: httpTimeout},
+		http:     newHTTPClient(),
+		token:    os.Getenv(internalTokenEnv),
 		values:   local,
 	}, nil
 }
 
+// authRequired сообщает, включён ли fail-closed режим окружения.
+func authRequired() bool {
+	switch strings.ToLower(os.Getenv(authRequiredEnv)) {
+	case "1", "true", "yes":
+		return true
+	}
+	return false
+}
+
+// requireSecureEnv проверяет наличие настроек безопасности: в защищённом
+// окружении сервис без токена не должен стартовать.
+func requireSecureEnv() error {
+	if os.Getenv(internalTokenEnv) == "" {
+		return fmt.Errorf("%s is set: %s must not be empty", authRequiredEnv, internalTokenEnv)
+	}
+	return nil
+}
+
+// newHTTPClient собирает HTTP-клиент исходящих запросов.
+func newHTTPClient() *http.Client {
+	return &http.Client{Timeout: httpTimeout}
+}
+
+// HTTPClient возвращает HTTP-клиент для походов в сервисы по discovery.
+func HTTPClient() (*http.Client, error) {
+	return newHTTPClient(), nil
+}
+
+// HTTPTransport возвращает транспорт для reverse proxy, ходящих
+// в инстансы сервисов напрямую.
+func HTTPTransport() (http.RoundTripper, error) {
+	return http.DefaultTransport, nil
+}
+
 // parseCitadel разбирает список адресов citadel: элементы через запятую,
-// каждый — «адрес[=имя_контейнера]»; схема http:// допустима и отбрасывается.
+// каждый — «хост:порт»; префикс http:// допустим и отбрасывается.
 func parseCitadel(list string) ([]instance, error) {
 	entries := strings.Split(list, ",")
 	citadels := make([]instance, 0, len(entries))
@@ -108,14 +165,10 @@ func parseCitadel(list string) ([]instance, error) {
 		if e == "" {
 			continue
 		}
-		inst := instance{Addr: e}
-		if addr, container, ok := strings.Cut(e, "="); ok {
-			inst = instance{Addr: addr, Container: container}
+		if _, _, err := net.SplitHostPort(e); err != nil {
+			return nil, fmt.Errorf("failed parse citadel addr %q: %w", e, err)
 		}
-		if _, _, err := net.SplitHostPort(inst.Addr); err != nil {
-			return nil, fmt.Errorf("failed parse citadel addr %q: %w", inst.Addr, err)
-		}
-		citadels = append(citadels, inst)
+		citadels = append(citadels, instance{Addr: e})
 	}
 	if len(citadels) == 0 {
 		return nil, errors.New("citadel address list is empty")
@@ -256,9 +309,9 @@ func (c *Client) Time(name string) time.Time {
 }
 
 // do выполняет запрос к citadel и возвращает тело ответа. Инстансы citadel
-// обходятся в порядке citadelOrder (локальный — первым); сбойный инстанс
-// (кроме штатного ErrNotFound) заменяется следующим. Каждая ошибка вызова
-// логируется. pathArgs — подстановки в path (по умолчанию имя приложения).
+// обходятся по round-robin; сбойный инстанс (кроме штатного ErrNotFound)
+// заменяется следующим. Каждая ошибка вызова логируется. pathArgs —
+// подстановки в path (по умолчанию имя приложения).
 func (c *Client) do(ctx context.Context, method, path string, body []byte, wantStatus int, pathArgs ...string) ([]byte, error) {
 	args := make([]any, 0, len(pathArgs)+1)
 	for _, arg := range pathArgs {
@@ -270,11 +323,11 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte, wantS
 	reqPath := fmt.Sprintf(path, args...)
 
 	start := int(c.citadelIdx.Add(1) - 1)
-	self := c.selfHostAddr()
 	var data []byte
 	var err error
-	for _, inst := range c.citadelOrder(start) {
-		url := "http://" + localAddr(inst, self) + reqPath
+	for i := range c.citadels {
+		inst := c.citadels[(start+i)%len(c.citadels)]
+		url := "http://" + inst.Addr + reqPath
 		data, err = c.send(ctx, method, url, body, wantStatus)
 		if err == nil {
 			return data, nil
@@ -302,6 +355,10 @@ func (c *Client) send(ctx context.Context, method, url string, body []byte, want
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
+	}
+	// внутренний токен подтверждает сервису citadel доступ к API.
+	if c.token != "" {
+		req.Header.Set(internalTokenHeader, c.token)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
