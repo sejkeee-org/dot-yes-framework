@@ -1,6 +1,9 @@
 package dotyes
 
 import (
+	"bufio"
+	"fmt"
+	"net"
 	"net/http"
 	"time"
 )
@@ -25,6 +28,19 @@ func (m *Metrics) Middleware(mux *http.ServeMux) http.Handler {
 type statusRecorder struct {
 	http.ResponseWriter
 	code int
+}
+
+// Hijack preserves protocol upgrades such as WebSocket through metrics middleware.
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("response writer does not support hijacking")
+	}
+	conn, rw, err := h.Hijack()
+	if err == nil {
+		r.code = http.StatusSwitchingProtocols
+	}
+	return conn, rw, err
 }
 
 func (r *statusRecorder) WriteHeader(code int) {
